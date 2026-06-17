@@ -1,190 +1,240 @@
-"""Generate all publication figures from the saved result JSONs."""
-import os, sys, json, collections
+"""
+Auto-Clip CLAHE: Noise-Aware Automatic Parameter Selection for
+Adaptive Contrast Enhancement.
+
+This module implements:
+  - estimate_noise_mad : global noise floor (sigma) via the Median Absolute
+    Deviation (MAD) of the finest-scale diagonal wavelet sub-band
+    (Donoho & Johnstone, 1994).
+  - tile_entropy        : per-tile Shannon entropy (local texture energy).
+  - clahe_per_tile      : a custom CLAHE that accepts a DIFFERENT clip limit
+    for every tile (OpenCV's CLAHE only supports a single global clip limit),
+    with bilinear interpolation of the tile mappings (Zuiderveld, 1994).
+  - auto_clip_clahe     : the proposed method. Computes C_{i,j} = alpha +
+    beta * (E_{i,j} / (sigma + eps)) per tile and feeds it to clahe_per_tile.
+
+All enhancement is performed on the L (lightness) channel in CIELAB space so
+that chrominance is preserved; the colour image is reconstructed afterwards.
+
+Author: Yagizefe Aydin (2211051071), COMP430 Digital Image Processing.
+"""
+
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib import cm
 import cv2
-sys.path.insert(0, "src")
-from autoclahe import (auto_clip_clahe, fixed_clahe, global_he,
-                       compute_clip_map, estimate_noise_mad)
-import metrics as M
-from experiment import load_base, make_noisy, GRID
-
-plt.rcParams.update({
-    "font.family": "serif", "font.size": 9, "axes.grid": True,
-    "grid.alpha": 0.3, "figure.dpi": 150, "savefig.dpi": 300,
-    "axes.spines.top": False, "axes.spines.right": False,
-})
-os.makedirs("figures", exist_ok=True)
-LEVELS = [0, 5, 10, 15, 20, 25]
-COL = {"GHE": "#7f7f7f", "Fixed-CLAHE-low": "#1f77b4",
-       "Fixed-CLAHE-high": "#d62728", "Auto-Clip": "#2ca02c"}
-MK = {"GHE": "o", "Fixed-CLAHE-low": "s", "Fixed-CLAHE-high": "^", "Auto-Clip": "D"}
-
-
-def agg_main():
-    rows = json.load(open("results/main_eval.json"))
-    a = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.defaultdict(list)))
-    for r in rows:
-        for k in ["dH", "BRISQUE", "PSNR", "SSIM"]:
-            if r[k] is not None:
-                a[r["method"]][r["sigma"]][k].append(r[k])
-    return a
+import pywt
 
 
 # --------------------------------------------------------------------------- #
-# FIG 1: main metrics vs sigma (BRISQUE, entropy gain, SSIM)
+# 1. Global noise-floor estimation (MAD on diagonal wavelet coefficients)
 # --------------------------------------------------------------------------- #
-def fig_metrics():
-    a = agg_main()
-    methods = ["GHE", "Fixed-CLAHE-low", "Fixed-CLAHE-high", "Auto-Clip"]
-    fig, ax = plt.subplots(1, 3, figsize=(10.5, 3.1))
-    # BRISQUE
-    for m in methods:
-        y = [np.mean(a[m][s]["BRISQUE"]) for s in LEVELS]
-        ax[0].plot(LEVELS, y, marker=MK[m], color=COL[m], label=m, ms=4, lw=1.5)
-    ax[0].set_title("(a) BRISQUE  (lower = better)")
-    ax[0].set_xlabel(r"noise level $\sigma$"); ax[0].set_ylabel("BRISQUE")
-    # Entropy gain
-    for m in methods:
-        y = [np.mean(a[m][s]["dH"]) for s in LEVELS]
-        ax[1].plot(LEVELS, y, marker=MK[m], color=COL[m], label=m, ms=4, lw=1.5)
-    ax[1].set_title("(b) Entropy gain $\\Delta H$  (higher = better)")
-    ax[1].set_xlabel(r"noise level $\sigma$"); ax[1].set_ylabel(r"$\Delta H$ (bits)")
-    # SSIM
-    lv = LEVELS[1:]
-    for m in methods:
-        y = [np.mean(a[m][s]["SSIM"]) for s in lv]
-        ax[2].plot(lv, y, marker=MK[m], color=COL[m], label=m, ms=4, lw=1.5)
-    ax[2].set_title("(c) SSIM vs. clean-enhanced (robustness)")
-    ax[2].set_xlabel(r"noise level $\sigma$"); ax[2].set_ylabel("SSIM")
-    h, l = ax[0].get_legend_handles_labels()
-    fig.legend(h, l, loc="lower center", ncol=4, frameon=False,
-               bbox_to_anchor=(0.5, -0.04))
-    fig.tight_layout(rect=[0, 0.05, 1, 1])
-    fig.savefig("figures/fig_metrics.png", bbox_inches="tight")
-    plt.close(fig); print("saved fig_metrics.png")
+def estimate_noise_mad(gray):
+    """Estimate the global noise standard deviation (0-255 scale).
+
+    Uses the robust MAD estimator on the diagonal (HH) detail coefficients of
+    a single-level 'db1' (Haar) wavelet decomposition:
+
+        sigma = median(|HH|) / 0.6745
+
+    This is the canonical wavelet noise estimator of Donoho & Johnstone (1994).
+    The diagonal band is dominated by high-frequency content; for natural
+    images its robust spread is an effective proxy for the sensor noise floor.
+    """
+    g = gray.astype(np.float64)
+    # Single-level 2-D DWT; cD = diagonal detail coefficients (HH band).
+    _, (_, _, cD) = pywt.dwt2(g, "db1")
+    mad = np.median(np.abs(cD - np.median(cD)))
+    sigma = mad / 0.6745
+    return float(sigma)
 
 
 # --------------------------------------------------------------------------- #
-# FIG 2: grid-search heatmap of objective J
+# 2. Per-tile Shannon entropy (local texture energy E_{i,j})
 # --------------------------------------------------------------------------- #
-def fig_gridsearch():
-    gs = json.load(open("results/grid_search.json"))
-    alphas, betas = gs["alphas"], gs["betas"]
-    J = np.array(gs["J"]).reshape(len(alphas), len(betas))
-    fig, ax = plt.subplots(figsize=(4.4, 3.0))
-    im = ax.imshow(J, aspect="auto", origin="lower", cmap="viridis")
-    ax.set_xticks(range(len(betas))); ax.set_xticklabels(betas)
-    ax.set_yticks(range(len(alphas))); ax.set_yticklabels(alphas)
-    ax.set_xlabel(r"$\beta$ (scaling gain)"); ax.set_ylabel(r"$\alpha$ (baseline)")
-    bi = gs["combos"].index(gs["best"])
-    by, bx = divmod(bi, len(betas))
-    ax.scatter([bx], [by], marker="*", s=220, c="white", edgecolor="k", zorder=3)
-    for i in range(len(alphas)):
-        for j in range(len(betas)):
-            ax.text(j, i, f"{J[i,j]:.2f}", ha="center", va="center",
-                    color="w" if J[i, j] < J.mean() else "k", fontsize=7)
-    ax.set_title(r"Objective $J=G-\lambda P$  (★ = optimum)")
-    ax.grid(False)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="J")
-    fig.tight_layout()
-    fig.savefig("figures/fig_gridsearch.png", bbox_inches="tight")
-    plt.close(fig); print("saved fig_gridsearch.png")
+def _shannon_entropy(tile):
+    """Shannon entropy (bits) of an 8-bit tile from its 256-bin histogram."""
+    hist = np.bincount(tile.ravel(), minlength=256).astype(np.float64)
+    p = hist / max(hist.sum(), 1.0)
+    nz = p > 0
+    return float(-np.sum(p[nz] * np.log2(p[nz])))
+
+
+def tile_entropy(gray, grid):
+    """Return a (gy, gx) array of per-tile Shannon entropies."""
+    h, w = gray.shape
+    gy, gx = grid
+    ent = np.zeros((gy, gx), dtype=np.float64)
+    ys = np.linspace(0, h, gy + 1).astype(int)
+    xs = np.linspace(0, w, gx + 1).astype(int)
+    for i in range(gy):
+        for j in range(gx):
+            tile = gray[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            ent[i, j] = _shannon_entropy(tile)
+    return ent
 
 
 # --------------------------------------------------------------------------- #
-# FIG 3: clip-map adaptivity (image + per-tile clip map at sigma 0 vs 25)
+# 3. Custom CLAHE with a per-tile clip limit + bilinear interpolation
 # --------------------------------------------------------------------------- #
-def fig_clipmap(name="kodim19"):
-    base = load_base(name)
-    fig, ax = plt.subplots(1, 3, figsize=(10.5, 3.4))
-    rgb = cv2.cvtColor(base, cv2.COLOR_BGR2RGB)
-    ax[0].imshow(rgb); ax[0].set_title("(a) low-contrast input"); ax[0].axis("off")
-    vmax = 0
-    maps = {}
-    for sig in [0, 25]:
-        inp = make_noisy(base, name, sig)
-        L = cv2.cvtColor(inp, cv2.COLOR_BGR2LAB)[:, :, 0]
-        s = estimate_noise_mad(L)
-        cmap, _ = compute_clip_map(L, s, GRID, 0.0, 0.02)
-        maps[sig] = (cmap, s)
-        vmax = max(vmax, cmap.max())
-    for k, sig in enumerate([0, 25]):
-        cmap, s = maps[sig]
-        im = ax[k + 1].imshow(cmap, cmap="inferno", vmin=0, vmax=vmax)
-        ax[k + 1].set_title(f"(b{k}) clip map  $\\sigma$={sig}, $\\hat\\sigma$={s:.1f}")
-        ax[k + 1].set_xticks([]); ax[k + 1].set_yticks([]); ax[k + 1].grid(False)
-        fig.colorbar(im, ax=ax[k + 1], fraction=0.046, pad=0.04,
-                     label="clip limit $C_{i,j}$")
-    fig.tight_layout()
-    fig.savefig("figures/fig_clipmap.png", bbox_inches="tight")
-    plt.close(fig); print("saved fig_clipmap.png")
+def _tile_lut(tile, clip_count):
+    """Build the 256-entry mapping LUT for one tile.
+
+    clip_count : maximum number of pixels allowed in any histogram bin.
+                 The excess is clipped and redistributed uniformly
+                 (Zuiderveld, 1994).
+    """
+    hist = np.bincount(tile.ravel(), minlength=256).astype(np.float64)
+    clip_count = max(1.0, float(clip_count))
+    excess = np.maximum(hist - clip_count, 0.0).sum()
+    hist = np.minimum(hist, clip_count)
+    # Redistribute the clipped excess uniformly across all 256 bins.
+    hist += excess / 256.0
+    cdf = np.cumsum(hist)
+    total = cdf[-1]
+    if total <= 0:
+        return np.arange(256, dtype=np.float64)
+    lut = (cdf - cdf.min()) / (total - cdf.min() + 1e-12) * 255.0
+    return lut
+
+
+def clahe_per_tile(gray, clip_map, grid):
+    """CLAHE allowing a distinct clip limit per tile, with bilinear blending.
+
+    Parameters
+    ----------
+    gray     : uint8 image (single channel).
+    clip_map : (gy, gx) array. clip_map[i, j] is the NORMALISED clip limit for
+               tile (i, j), expressed as a fraction of the tile's pixel count
+               (e.g. 0.01 == clip every bin at 1% of the tile pixels).
+    grid     : (gy, gx) number of tiles.
+
+    Returns
+    -------
+    uint8 enhanced image of the same shape.
+    """
+    h, w = gray.shape
+    gy, gx = grid
+    ys = np.linspace(0, h, gy + 1).astype(int)
+    xs = np.linspace(0, w, gx + 1).astype(int)
+
+    # Build a LUT for every tile.
+    luts = np.zeros((gy, gx, 256), dtype=np.float64)
+    cy = np.zeros(gy)
+    cx = np.zeros(gx)
+    for i in range(gy):
+        cy[i] = 0.5 * (ys[i] + ys[i + 1])
+        for j in range(gx):
+            cx[j] = 0.5 * (xs[j] + xs[j + 1])
+            tile = gray[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]
+            n_pix = tile.size
+            clip_count = clip_map[i, j] * n_pix
+            luts[i, j] = _tile_lut(tile, clip_count)
+
+    # Bilinear interpolation of the four neighbouring tile-centre mappings.
+    out = np.zeros_like(gray, dtype=np.float64)
+    yy = np.arange(h, dtype=np.float64)
+    xx = np.arange(w, dtype=np.float64)
+
+    # Row tile indices / weights
+    iy = np.clip(np.searchsorted(cy, yy) - 1, 0, gy - 2) if gy > 1 else np.zeros(h, int)
+    ix = np.clip(np.searchsorted(cx, xx) - 1, 0, gx - 2) if gx > 1 else np.zeros(w, int)
+
+    for r in range(h):
+        if gy > 1:
+            i0 = iy[r]; i1 = i0 + 1
+            ty = (yy[r] - cy[i0]) / (cy[i1] - cy[i0] + 1e-12)
+            ty = min(max(ty, 0.0), 1.0)
+        else:
+            i0 = i1 = 0; ty = 0.0
+        row = gray[r]
+        # Vectorised over the row:
+        if gx > 1:
+            j0 = ix; j1 = ix + 1
+            tx = (xx - cx[j0]) / (cx[j1] - cx[j0] + 1e-12)
+            tx = np.clip(tx, 0.0, 1.0)
+        else:
+            j0 = np.zeros(w, int); j1 = j0; tx = np.zeros(w)
+        v = row
+        m00 = luts[i0, j0, v]
+        m01 = luts[i0, j1, v]
+        m10 = luts[i1, j0, v]
+        m11 = luts[i1, j1, v]
+        top = m00 * (1 - tx) + m01 * tx
+        bot = m10 * (1 - tx) + m11 * tx
+        out[r] = top * (1 - ty) + bot * ty
+
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- #
-# FIG 4: ablation (BRISQUE vs sigma for the three variants)
+# 4. The proposed Auto-Clip CLAHE
 # --------------------------------------------------------------------------- #
-def fig_ablation():
-    ab = json.load(open("results/ablations.json"))
-    labels = {"entropy": "Full (entropy + noise term)",
-              "variance": "Variance texture",
-              "no_noise_term": r"No noise term ($C=\alpha+\beta E$)"}
-    cols = {"entropy": "#2ca02c", "variance": "#9467bd", "no_noise_term": "#d62728"}
-    fig, ax = plt.subplots(1, 2, figsize=(7.5, 3.0))
-    for v in ["entropy", "variance", "no_noise_term"]:
-        by = collections.defaultdict(lambda: collections.defaultdict(list))
-        for r in ab[v]:
-            by[r["sigma"]]["dH"].append(r["dH"]); by[r["sigma"]]["BR"].append(r["BRISQUE"])
-        ax[0].plot(LEVELS, [np.mean(by[s]["BR"]) for s in LEVELS], marker="o",
-                   color=cols[v], label=labels[v], ms=4, lw=1.5)
-        ax[1].plot(LEVELS, [np.mean(by[s]["dH"]) for s in LEVELS], marker="o",
-                   color=cols[v], label=labels[v], ms=4, lw=1.5)
-    ax[0].set_title("(a) BRISQUE (lower = better)")
-    ax[0].set_xlabel(r"$\sigma$"); ax[0].set_ylabel("BRISQUE")
-    ax[1].set_title(r"(b) Entropy gain $\Delta H$")
-    ax[1].set_xlabel(r"$\sigma$"); ax[1].set_ylabel(r"$\Delta H$ (bits)")
-    ax[0].legend(frameon=False, fontsize=7.5)
-    fig.tight_layout()
-    fig.savefig("figures/fig_ablation.png", bbox_inches="tight")
-    plt.close(fig); print("saved fig_ablation.png")
+def compute_clip_map(gray, sigma, grid, alpha, beta, eps=1.0,
+                     c_min=0.001, c_max=0.05, texture="entropy"):
+    """Compute the per-tile adaptive clip limit C_{i,j}.
+
+        C_{i,j} = alpha + beta * ( E_{i,j} / (sigma + eps) )
+
+    The result is clamped to [c_min, c_max] for numerical stability.
+    """
+    if texture == "entropy":
+        E = tile_entropy(gray, grid)
+    elif texture == "variance":
+        # Normalised local variance as an alternative texture descriptor.
+        h, w = gray.shape
+        gy, gx = grid
+        E = np.zeros((gy, gx))
+        ys = np.linspace(0, h, gy + 1).astype(int)
+        xs = np.linspace(0, w, gx + 1).astype(int)
+        for i in range(gy):
+            for j in range(gx):
+                t = gray[ys[i]:ys[i + 1], xs[j]:xs[j + 1]].astype(np.float64)
+                E[i, j] = np.log1p(t.var())
+    else:
+        raise ValueError(texture)
+
+    C = alpha + beta * (E / (sigma + eps))
+    return np.clip(C, c_min, c_max), E
+
+
+def auto_clip_clahe(bgr, grid=(8, 8), alpha=0.005, beta=0.004, eps=1.0,
+                    c_min=0.001, c_max=0.05, texture="entropy",
+                    return_info=False):
+    """Apply the proposed Auto-Clip CLAHE to a colour (BGR) image.
+
+    Enhancement is performed on the L channel in CIELAB space.
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0]
+    sigma = estimate_noise_mad(L)
+    clip_map, E = compute_clip_map(L, sigma, grid, alpha, beta, eps,
+                                   c_min, c_max, texture)
+    L_enh = clahe_per_tile(L, clip_map, grid)
+    lab[:, :, 0] = L_enh
+    out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    if return_info:
+        return out, {"sigma": sigma, "clip_map": clip_map, "entropy": E}
+    return out
 
 
 # --------------------------------------------------------------------------- #
-# FIG 5: qualitative crops at a fixed noise level
+# 5. Baselines
 # --------------------------------------------------------------------------- #
-def fig_qualitative(name="kodim19", sig=20):
-    base = load_base(name)
-    inp = make_noisy(base, name, sig)
-    outs = {
-        "Noisy input": inp,
-        "GHE": global_he(inp),
-        "Fixed-CLAHE-high": fixed_clahe(inp, 0.04, GRID),
-        "Auto-Clip": auto_clip_clahe(inp, grid=GRID, alpha=0.0, beta=0.02),
-    }
-    # crop a flat-sky region (top) where noise amplification shows
-    y0, y1, x0, x1 = 20, 180, 60, 300
-    fig, ax = plt.subplots(2, 4, figsize=(11, 4.6))
-    for k, (lbl, im) in enumerate(outs.items()):
-        rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-        ax[0, k].imshow(rgb); ax[0, k].set_title(lbl, fontsize=9)
-        ax[0, k].add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                         ec="yellow", fc="none", lw=1.2))
-        ax[0, k].axis("off")
-        ax[1, k].imshow(rgb[y0:y1, x0:x1]); ax[1, k].axis("off")
-        ax[1, k].set_title("sky crop (noise)", fontsize=8)
-    fig.suptitle(f"Qualitative comparison on {name}, $\\sigma$={sig}", y=1.02)
-    fig.tight_layout()
-    fig.savefig("figures/fig_qualitative.png", bbox_inches="tight")
-    plt.close(fig); print("saved fig_qualitative.png")
+def global_he(bgr):
+    """Global Histogram Equalisation on the L channel."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    lab[:, :, 0] = cv2.equalizeHist(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-if __name__ == "__main__":
-    fig_metrics()
-    fig_gridsearch()
-    fig_clipmap()
-    fig_ablation()
-    fig_qualitative()
-    print("All figures generated.")
+def fixed_clahe(bgr, clip=0.01, grid=(8, 8)):
+    """Fixed-parameter CLAHE using the same custom engine with a CONSTANT clip.
+
+    `clip` is the normalised clip limit (fraction of tile pixels) applied to
+    every tile, so the comparison against the adaptive method is apples-to-
+    apples (same CLAHE engine, only the clip map differs).
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0]
+    clip_map = np.full(grid, clip, dtype=np.float64)
+    lab[:, :, 0] = clahe_per_tile(L, clip_map, grid)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
